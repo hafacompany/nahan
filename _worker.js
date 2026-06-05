@@ -15,6 +15,7 @@ const SYSTEM_DEFAULTS = {
     backupRelay: "",
     masterKey: "admin",
     metricNode: "time.is",
+    extraProfiles: "",
     cleanIps: "",
     deviceId: "",
     mode: "alpha",
@@ -28,9 +29,13 @@ const SYSTEM_DEFAULTS = {
     tgChatId: "",
     cfAccountId: "",
     cfApiToken: "",
+    isPaused: false,
+    silentAlerts: false,
 };
 
 let sysConfig = { ...SYSTEM_DEFAULTS };
+let isolateStartTime = Date.now();
+let activeConnections = 0;
 let activeDeviceId = "";
 
 export default {
@@ -52,9 +57,10 @@ export default {
                 auth: `/${encodeURI(sysConfig.apiRoute)}/api/auth`,
                 sync: `/${encodeURI(sysConfig.apiRoute)}/api/sync`,
                 tg: `/${encodeURI(sysConfig.apiRoute)}/tg`,
+                logs: `/${encodeURI(sysConfig.apiRoute)}/api/logs`,
             };
 
-            const isAuthorizedRoute = reqPath === routes.data || reqPath === routes.dash || reqPath === routes.auth || reqPath === routes.sync || reqPath === routes.tg;
+            const isAuthorizedRoute = reqPath === routes.data || reqPath === routes.dash || reqPath === routes.auth || reqPath === routes.sync || reqPath === routes.tg || reqPath === routes.logs;
 
             if (!isTelemetryStream && !isAuthorizedRoute) {
                 return serveMaintenancePage(request, url);
@@ -66,11 +72,15 @@ export default {
                 }
                 if (reqPath === routes.auth) {
                     if (request.method !== "POST") return new Response("405", { status: 405 });
-                    return await handleAuth(request, url.hostname, ctx);
+                    return await handleAuth(request, url.hostname, ctx, env);
                 }
                 if (reqPath === routes.sync) {
                     if (request.method !== "POST") return new Response("405", { status: 405 });
                     return await handleConfigSync(request, env, ctx);
+                }
+                if (reqPath === routes.logs) {
+                    if (request.method !== "POST" && request.method !== "GET") return new Response("405", { status: 405 });
+                    return await handleLogs(request, env);
                 }
                 if (reqPath === routes.tg) {
                     if (request.method !== "POST") return new Response("405", { status: 405 });
@@ -82,16 +92,20 @@ export default {
                         return serveMaintenancePage(request, url);
                     }
                     const clientHost = request.headers.get("Host") || url.hostname;
+                    let targetSub = url.searchParams.get("sub");
                     if (ua.includes(getGamma()) || ua.includes("meta") || ua.includes("stash")) {
-                        return new Response(buildYamlProfile(clientHost));
+                        return new Response(buildYamlProfile(clientHost, targetSub));
                     } else {
-                        const raw = buildUriProfile(clientHost);
+                        const raw = buildUriProfile(clientHost, targetSub);
                         return new Response(btoa(raw));
                     }
                 }
             }
 
-            if (isTelemetryStream) return await processTelemetryStream();
+            if (isTelemetryStream) {
+                if (sysConfig.isPaused) return new Response(null, { status: 503 });
+                return await processTelemetryStream();
+            }
 
             return new Response(null, { status: 404 });
         } catch (err) {
@@ -218,13 +232,44 @@ async function sendTelegramMessage(request, type) {
     } catch (e) {}
 }
 
-async function handleAuth(request, hostName, ctx) {
+async function logActivity(env, type, detail) {
+    if (!env || !env.IOT_DB) return;
+    try {
+        const ts = new Date().toISOString();
+        let logs = [];
+        const stored = await env.IOT_DB.get("sys_logs");
+        if (stored) logs = JSON.parse(stored);
+        logs.unshift({ ts, type, detail });
+        if (logs.length > 50) logs = logs.slice(0, 50);
+        await env.IOT_DB.put("sys_logs", JSON.stringify(logs));
+    } catch (e) {}
+}
+
+async function handleLogs(request, env) {
+    try {
+        if (request.method === "POST") {
+            const data = await request.json();
+            if (data.key !== sysConfig.masterKey) return new Response(JSON.stringify({ success: false }), { status: 401 });
+            let logs = [];
+            if (env.IOT_DB) {
+                const stored = await env.IOT_DB.get("sys_logs");
+                if (stored) logs = JSON.parse(stored);
+            }
+            return new Response(JSON.stringify({ success: true, logs }), { status: 200 });
+        }
+        return new Response("OK", { status: 200 });
+    } catch (e) { return new Response(JSON.stringify({ success: false }), { status: 400 }); }
+}
+
+async function handleAuth(request, hostName, ctx, env) {
     try {
         const data = await request.json();
+        const ip = request.headers.get("cf-connecting-ip") || "Unknown";
         if (data.key === sysConfig.masterKey) {
-            if (ctx) ctx.waitUntil(sendTelegramMessage(request, "ورود به پنل"));
+            ctx?.waitUntil(logActivity(env, "Auth Success", `Successful panel login from ${ip}`));
+            if (!sysConfig.silentAlerts && ctx) ctx.waitUntil(sendTelegramMessage(request, "ورود به پنل (موفق)"));
             const netInfo = {
-                ip: request.headers.get("cf-connecting-ip") || "Unknown",
+                ip: ip,
                 colo: request.cf?.colo || "Unknown",
                 loc: (request.cf?.city || "Unknown") + ", " + (request.cf?.country || "Unknown")
             };
@@ -233,6 +278,8 @@ async function handleAuth(request, hostName, ctx) {
                 links: { direct: buildSingleUri(hostName), sync: `https://${hostName}/${sysConfig.apiRoute}` }
             }), { status: 200 });
         }
+        ctx?.waitUntil(logActivity(env, "Auth Failed", `Failed login attempt from ${ip}`));
+        if (ctx) ctx.waitUntil(sendTelegramMessage(request, "تلاش ناموفق ورود به پنل!"));
         return new Response(JSON.stringify({ success: false }), { status: 401 });
     } catch (e) { return new Response(JSON.stringify({ success: false }), { status: 400 }); }
 }
@@ -296,40 +343,74 @@ async function handleTelegramWebhook(request, env, hostName) {
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ 
                             chat_id: chatId, 
-                            text: `🔗 **لینک ساب شما:**\n\n<code>${subSync}</code>`, 
+                            text: `🔗 **لینک استریم شما:**\n\n<code>${subSync}</code>`, 
                             parse_mode: 'HTML' 
                         })
                     });
                     await fetch(`${tgApi}/answerCallbackQuery`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ callback_query_id: cb.id, text: "لینک ساب ارسال شد." })
+                        body: JSON.stringify({ callback_query_id: cb.id, text: "لینک استریم ارسال شد." })
                     });
+                } else if (data === "cb_pause") {
+                    sysConfig.isPaused = true;
+                    await env.IOT_DB.put("sys_config", JSON.stringify({ ...sysConfig, isPaused: true }));
+                    await fetch(`${tgApi}/answerCallbackQuery`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ callback_query_id: cb.id, text: "سیستم متوقف شد. 🔴" }) });
+                } else if (data === "cb_resume") {
+                    sysConfig.isPaused = false;
+                    await env.IOT_DB.put("sys_config", JSON.stringify({ ...sysConfig, isPaused: false }));
+                    await fetch(`${tgApi}/answerCallbackQuery`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ callback_query_id: cb.id, text: "سیستم مجدداً فعال شد. 🟢" }) });
                 }
             }
         } else if (update.message && update.message.text) {
             const chatId = update.message.chat.id;
             
             if (chatId.toString() === sysConfig.tgChatId.toString()) {
-                const panelUrl = `https://${hostName}/${encodeURI(sysConfig.apiRoute)}/dash`;
-                await fetch(`${tgApi}/sendMessage`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        chat_id: chatId,
-                        text: "🤖 **ربات مدیریت پروکسی نهان**\nانتخاب کنید:",
-                        parse_mode: 'HTML',
-                        reply_markup: {
-                            inline_keyboard: [
-                                [{ text: "ورود به پنل 🔐", web_app: { url: panelUrl } }],
-                                [
-                                    { text: "دریافت ساب 🔗", callback_data: "get_sub" },
-                                    { text: "بروزرسانی مصرف 📊", callback_data: "get_usage" }
+                const text = update.message.text;
+                if (text === "/status") {
+                    await fetch(`${tgApi}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text: `وضعیت سیستم: ${sysConfig.isPaused ? "🔴 متوقف شده" : "🟢 فعال"}` }) });
+                } else if (text === "/pause") {
+                    sysConfig.isPaused = true;
+                    await env.IOT_DB.put("sys_config", JSON.stringify({ ...sysConfig, isPaused: true }));
+                    await fetch(`${tgApi}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text: "🔴 جریان داده‌ها متوقف شد." }) });
+                } else if (text === "/resume") {
+                    sysConfig.isPaused = false;
+                    await env.IOT_DB.put("sys_config", JSON.stringify({ ...sysConfig, isPaused: false }));
+                    await fetch(`${tgApi}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text: "🟢 جریان داده‌ها مجدداً برقرار شد." }) });
+                } else if (text === "/ping") {
+                    const upSeconds = Math.floor((Date.now() - isolateStartTime)/1000);
+                    const dh = Math.floor(upSeconds/3600);
+                    const dm = Math.floor((upSeconds%3600)/60);
+                    await fetch(`${tgApi}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text: `🟢 Gateway Health:\n\n⏱ Uptime: ${dh}h ${dm}m\n📡 Active Streams: ${activeConnections}` }) });
+                } else if (text === "/panic") {
+                    sysConfig.apiRoute = Array.from(crypto.getRandomValues(new Uint8Array(8))).map(b => b.toString(16).padStart(2,'0')).join('');
+                    sysConfig.isPaused = true;
+                    await env.IOT_DB.put("sys_config", JSON.stringify(sysConfig));
+                    await fetch(`${tgApi}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text: `🚨 PANIC MODE ACTIVATED 🚨\n\nRoute randomized & System Paused.\nAccess Revoked.` }) });
+                } else {
+                    const panelUrl = `https://${hostName}/${encodeURI(sysConfig.apiRoute)}/dash`;
+                    await fetch(`${tgApi}/sendMessage`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            chat_id: chatId,
+                            text: "🤖 **ربات سیستم نهان**\nانتخاب کنید:\n\nدستورات سریع:\n/pause - توقف اتصالات\n/resume - از سرگیری\n/status - وضعیت\n/ping - پراکسی وضعیت\n/panic - قطع دسترسی 🚨",
+                            parse_mode: 'HTML',
+                            reply_markup: {
+                                inline_keyboard: [
+                                    [{ text: "ورود به کنترل‌پنل 🔐", web_app: { url: panelUrl } }],
+                                    [
+                                        { text: "دریافت استریم 🔗", callback_data: "get_sub" },
+                                        { text: "بررسی محدودیت 📊", callback_data: "get_usage" }
+                                    ],
+                                    [
+                                        { text: sysConfig.isPaused ? "▶️ شروع سیستم" : "⏸ توقف سیستم", callback_data: sysConfig.isPaused ? "cb_resume" : "cb_pause" }
+                                    ]
                                 ]
-                            ]
-                        }
-                    })
-                });
+                            }
+                        })
+                    });
+                }
             }
         }
         return new Response("OK", { status: 200 });
@@ -347,6 +428,9 @@ async function processTelemetryStream() {
 }
 
 async function startDataPipe(webSocket) {
+    activeConnections++;
+    webSocket.addEventListener('close', () => activeConnections--);
+    webSocket.addEventListener('error', () => activeConnections--);
     let remoteSocket, dataWriter, isInit = true, queue = Promise.resolve();
     webSocket.addEventListener("message", (event) => {
         queue = queue.then(async () => {
@@ -368,6 +452,12 @@ async function startDataPipe(webSocket) {
 
         if (view[0] === 0x00) {
             isModeAlpha = true;
+            
+            // Validate UUID
+            let clientHash = Array.from(view.slice(1, 17)).map(b => b.toString(16).padStart(2, '0')).join('');
+            let validUUIDs = getAllProfiles().map(p => p.id.replace(/-/g, '').toLowerCase());
+            if (!validUUIDs.includes(clientHash)) return false; // DROP IF INVALID PROFILE
+            
             const optLen = view[17];
             const pPos = 18 + optLen + 1;
             targetPort = new DataView(bufferData.slice(pPos, pPos + 2)).getUint16(0);
@@ -431,6 +521,28 @@ function getCleanIps(hostName) {
     return ips;
 }
 
+
+function getAllProfiles(targetSub = null) {
+    let list = [{ id: activeDeviceId, name: "Default" }];
+    if (sysConfig.extraProfiles) {
+        let lines = sysConfig.extraProfiles.split(/[\r\n]+/).filter(Boolean);
+        lines.forEach(l => {
+            let parts = l.split(':');
+            if(parts.length >= 2) {
+                let id = parts[0].trim();
+                let name = parts.slice(1).join(':').trim();
+                if(id && name) list.push({id, name});
+            } else if (parts[0].trim()) {
+                list.push({id: parts[0].trim(), name: "Profile-" + list.length});
+            }
+        });
+    }
+    if (targetSub) {
+        list = list.filter(p => p.name.toLowerCase() === targetSub.toLowerCase());
+    }
+    return list;
+}
+
 function buildSingleUri(hostName) {
     let finalIP = getCleanIps(hostName)[0];
     let sec = getTransportParams(sysConfig.socketPort);
@@ -441,35 +553,48 @@ function buildSingleUri(hostName) {
     return `${uriProto}://${activeDeviceId}@${finalIP}:${sysConfig.socketPort}?${ext}#${hostName}`;
 }
 
-function buildUriProfile(hostName) {
+function buildUriProfile(hostName, targetSub = null) {
     let ips = getCleanIps(hostName);
     let sec = getTransportParams(sysConfig.socketPort);
     let reqPath = encodeURI(`/${sysConfig.apiRoute}`);
-    let ext = `encryption=none&security=${sec}&sni=${hostName}&fp=${sysConfig.agent}&type=ws&host=${hostName}&path=${reqPath}`;
-    if (sysConfig.enableOpt2) ext += `&pbk=enabled`;
+    let extBase = `encryption=none&security=${sec}&sni=${hostName}&fp=${sysConfig.agent}&type=ws&host=${hostName}&path=${reqPath}`;
+    if (sysConfig.enableOpt2) extBase += `&pbk=enabled`;
 
     let lines = [];
-    ips.forEach(ip => {
-        lines.push(`${getAlpha()}://${activeDeviceId}@${ip}:${sysConfig.socketPort}?${ext}#V-Core-[${ip}]`);
-        lines.push(`${getBeta()}://${activeDeviceId}@${ip}:${sysConfig.socketPort}?${ext}#T-Core-[${ip}]`);
+    let profiles = getAllProfiles(targetSub);
+    
+    profiles.forEach(p => {
+        ips.forEach(ip => {
+            let nameExt = p.name === "Default" ? `[${ip}]` : `[${ip}]-${p.name}`;
+            let vName = `V-Core-${nameExt}`;
+            let tName = `T-Core-${nameExt}`;
+            
+            lines.push(`${getAlpha()}://${p.id}@${ip}:${sysConfig.socketPort}?${extBase}#${vName}`);
+            lines.push(`${getBeta()}://${p.id}@${ip}:${sysConfig.socketPort}?${extBase}#${tName}`);
+        });
     });
     return lines.join('\n');
 }
 
-function buildYamlProfile(hostName) {
+function buildYamlProfile(hostName, targetSub = null) {
     let ips = getCleanIps(hostName);
-    let sec = getTransportParams(sysConfig.socketPort) === "tls";
+    let sec = getTransportParams(sysConfig.socketPort) === "tls" ? "true" : "false";
     let proxies = [];
     let proxyNames = [];
+    let profiles = getAllProfiles(targetSub);
 
-    ips.forEach(ip => {
-        let vName = `V-Core-[${ip}]`;
-        proxyNames.push(vName);
-        proxies.push(`- name: ${vName}\n  type: ${getAlpha()}\n  server: ${ip}\n  port: ${sysConfig.socketPort}\n  uuid: ${activeDeviceId}\n  udp: true\n  tls: ${sec}\n  sni: ${hostName}\n  client-fingerprint: ${sysConfig.agent}\n  network: ws\n  ws-opts:\n    path: "/${sysConfig.apiRoute}"\n    headers: { Host: ${hostName} }\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
+    profiles.forEach(p => {
+        ips.forEach(ip => {
+            let nameExt = p.name === "Default" ? `[${ip}]` : `[${ip}]-${p.name}`;
+            
+            let vName = `V-Core-${nameExt}`;
+            proxyNames.push(`"${vName}"`);
+            proxies.push(`- name: "${vName}"\n  type: ${getAlpha()}\n  server: ${ip}\n  port: ${sysConfig.socketPort}\n  uuid: ${p.id}\n  udp: true\n  tls: ${sec}\n  sni: ${hostName}\n  client-fingerprint: ${sysConfig.agent}\n  network: ws\n  ws-opts:\n    path: "/${sysConfig.apiRoute}"\n    headers: { Host: ${hostName} }\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
 
-        let tName = `T-Core-[${ip}]`;
-        proxyNames.push(tName);
-        proxies.push(`- name: ${tName}\n  type: ${getBeta()}\n  server: ${ip}\n  port: ${sysConfig.socketPort}\n  password: ${activeDeviceId}\n  udp: true\n  tls: ${sec}\n  sni: ${hostName}\n  client-fingerprint: ${sysConfig.agent}\n  network: ws\n  ws-opts:\n    path: "/${sysConfig.apiRoute}"\n    headers: { Host: ${hostName} }\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
+            let tName = `T-Core-${nameExt}`;
+            proxyNames.push(`"${tName}"`);
+            proxies.push(`- name: "${tName}"\n  type: ${getBeta()}\n  server: ${ip}\n  port: ${sysConfig.socketPort}\n  password: ${p.id}\n  udp: true\n  tls: ${sec}\n  sni: ${hostName}\n  client-fingerprint: ${sysConfig.agent}\n  network: ws\n  ws-opts:\n    path: "/${sysConfig.apiRoute}"\n    headers: { Host: ${hostName} }\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
+        });
     });
 
     return `proxies:\n${proxies.join('\n')}\nproxy-groups:\n- name: Data Group\n  type: select\n  proxies: \n${proxyNames.map(n => `    - ${n}`).join('\n')}\nrules:\n  - MATCH,Data Group\n`;
@@ -569,6 +694,10 @@ function getDashboardUI(hasDB) {
                   <button onclick="switchTab('advanced')" id="tab-advanced" class="nav-item flex items-center w-full px-4 py-3 rounded-lg text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 group">
                       <svg class="w-6 h-6 me-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>
                       <span class="font-semibold" data-i18n="tab_adv">Advanced</span>
+                  </button>
+                  <button onclick="switchTab('logs')" id="tab-logs" class="nav-item flex items-center w-full px-4 py-3 rounded-lg text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 group">
+                      <svg class="w-6 h-6 me-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"></path></svg>
+                      <span class="font-semibold" data-i18n="tab_logs">Activity logs</span>
                   </button>
               </nav>
               <div class="p-4 border-t border-slate-100 dark:border-darkborder/50">
@@ -734,6 +863,16 @@ function getDashboardUI(hasDB) {
                               <textarea id="cfg-ips" rows="3" data-i18n="ph_clean_ips" placeholder="" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none font-mono text-sm resize-none"></textarea>
                               <p class="text-xs text-slate-400 mt-2" data-i18n="desc_clean_ips">Put one IP per line. The Sync URL will multiply configs for all IPs.</p>
                           </div>
+                          
+                          <!-- Profiles Section -->
+                          <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder mt-6">
+                              <div class="flex items-center justify-between mb-4">
+                                  <h3 class="text-sm uppercase font-bold text-slate-500 tracking-wider" data-i18n="lbl_profiles">Multi-Sensor Profiles</h3>
+                                  <span class="text-xs bg-emerald-100 dark:bg-emerald-900/50 text-emerald-700 dark:text-emerald-300 px-2 py-1 rounded-md font-bold" id="profile-count-badge">No extra profiles</span>
+                              </div>
+                              <textarea id="cfg-profiles" rows="3" data-i18n="ph_profiles" placeholder="" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none font-mono text-sm resize-none"></textarea>
+                              <p class="text-xs text-slate-400 mt-2" data-i18n="desc_profiles">Format: uuid:name. One per line. Sub-link appending: /sync?sub=name</p>
+                          </div>
   
                           <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder grid grid-cols-1 md:grid-cols-2 gap-5">
                               <div class="space-y-1 text-start">
@@ -771,6 +910,25 @@ function getDashboardUI(hasDB) {
                               </label>
                           </div>
 
+                          <div class="flex flex-col sm:flex-row gap-4 p-4 bg-white dark:bg-darkcard rounded-3xl border border-slate-200 dark:border-darkborder mt-6">
+                              <!-- Silent Alert Toggle -->
+                              <label class="flex-1 flex items-center justify-between sm:justify-start cursor-pointer group bg-slate-50 dark:bg-slate-800/50 p-3 rounded-2xl">
+                                  <span class="text-sm font-bold text-slate-700 dark:text-slate-300 sm:me-4" data-i18n="lbl_silent">Silent UI Alerts</span>
+                                  <div class="relative inline-flex items-center cursor-pointer">
+                                      <input type="checkbox" id="cfg-silent" class="sr-only peer">
+                                      <div class="w-11 h-6 bg-slate-300 dark:bg-slate-600 rounded-full peer peer-checked:after:translate-x-5 rtl:peer-checked:after:-translate-x-5 peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-slate-500 peer-checked:bg-primary"></div>
+                                  </div>
+                              </label>
+                              <!-- Pause Kill Switch Toggle -->
+                              <label class="flex-1 flex items-center justify-between sm:justify-start cursor-pointer group bg-red-50 dark:bg-red-900/10 p-3 rounded-2xl border border-red-200 dark:border-red-900/30">
+                                  <span class="text-sm font-bold text-red-600 dark:text-red-400 sm:me-4" data-i18n="lbl_pause">Kill Switch (Pause System)</span>
+                                  <div class="relative inline-flex items-center cursor-pointer">
+                                      <input type="checkbox" id="cfg-pause" class="sr-only peer">
+                                      <div class="w-11 h-6 bg-red-200 dark:bg-red-900/50 rounded-full peer peer-checked:after:translate-x-5 rtl:peer-checked:after:-translate-x-5 peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-slate-500 peer-checked:bg-red-500"></div>
+                                  </div>
+                              </label>
+                          </div>
+
                           <!-- Telegram Bot Section -->
                           <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder grid grid-cols-1 md:grid-cols-2 gap-5 mt-6">
                               <div class="space-y-1 text-start">
@@ -795,6 +953,21 @@ function getDashboardUI(hasDB) {
                                   <input type="password" id="cfg-cf-token" placeholder="Bearer Token (Read Analytics)" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono">
                               </div>
                               <p class="text-xs text-slate-400 md:col-span-2" data-i18n="desc_cf_api">Optional: Monitor Worker free usage limits (100k/day). Needs Account Analytics Read permission.</p>
+                          </div>
+                      </div>
+                      
+                      <!-- LOGS VIEW -->
+                      <div id="view-logs" class="hidden space-y-6">
+                          <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder relative overflow-hidden">
+                              <div class="flex items-center justify-between mb-6">
+                                  <h3 class="text-sm uppercase font-bold text-slate-500 tracking-wider">System Activity Logs</h3>
+                                  <button onclick="loadLogs()" class="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-lg text-xs font-bold transition-colors">
+                                      🔄 Refresh
+                                  </button>
+                              </div>
+                              <div class="space-y-3" id="logs-container">
+                                  <p class="text-sm text-slate-400 text-center py-8">Loading activity logs...</p>
+                              </div>
                           </div>
                       </div>
                   </div>
@@ -825,6 +998,10 @@ function getDashboardUI(hasDB) {
                   <svg class="w-6 h-6 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>
                   <span class="text-[10px] font-bold" data-i18n="tab_adv">Network</span>
               </button>
+              <button onclick="switchTab('logs')" id="mob-tab-logs" class="mobile-nav-item flex flex-col items-center justify-center w-full h-full text-slate-400">
+                  <svg class="w-6 h-6 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"></path></svg>
+                  <span class="text-[10px] font-bold" data-i18n="tab_logs">Logs</span>
+              </button>
           </nav>
       </div>
   
@@ -837,27 +1014,31 @@ function getDashboardUI(hasDB) {
           const i18n = {
               en: {
                   title: "Nahan Gateway", pass_ph: "Master Key", login_btn: "Authenticate", err_pass: "Access Denied", missing_db: "⚠️ IOT_DB namespace missing! Settings won't save.",
-                  logout: "Disconnect", tab_info: "Endpoints", tab_status: "Metrics", tab_settings: "System", tab_adv: "Advanced",
+                  logout: "Disconnect", tab_info: "Endpoints", tab_status: "Metrics", tab_settings: "System", tab_adv: "Advanced", tab_logs: "Activity Logs",
                   qr_title: "Direct Stream Link", badge_multi: "Dual-Core Multiplexed", copy: "Copy", copied: "Copied to clipboard!", sync_link: "Cloud Sync URL", active_id: "Hardware ID",
                   stat_ip: "Origin IP", stat_dc: "Edge Node", stat_loc: "Data Region",
                   lbl_proto: "Primary Display Mode", lbl_port: "Data Port", lbl_id: "Device UUID (Empty=Auto)",
                   lbl_path: "API Route (Hidden Path)", lbl_pass: "Master Key", lbl_fp: "TLS Signature", lbl_dns: "Resolver IP",
+                  lbl_profiles: "Multi-Sensor Profiles", ph_profiles: "uuid1:User1\\nuuid2:User2", desc_profiles: "Format: uuid:name. Separate by line. For unique sub-nodes add ?sub=name to URL.",
                   lbl_clean_ips: "Clean IPs (Multi-Generator)", ph_clean_ips: "1.1.1.1, 2.2.2.2", desc_clean_ips: "Separate IPs by comma or new line. The Sync URL will multiply configs for all IPs.",
                   lbl_fake: "Maintenance Hosts (Camouflage)", lbl_tfo: "TCP Fast Open", lbl_ech: "Secure Hello (ECH)", lbl_tg_token: "Telegram Bot Token", lbl_tg_chat: "Telegram Chat ID", desc_tg_bot: "Set these values to receive login alerts via Telegram.",
                   lbl_cf_acc: "Cloudflare Account ID", lbl_cf_token: "Cloudflare API Token", desc_cf_api: "Optional: Monitor Worker daily usage limit (100k/day). Requires Account Analytics read permission.",
+                  lbl_silent: "Silent UI Alerts", lbl_pause: "Kill Switch (Pause System)",
                   save_btn: "Update Config", msg_saving: "Syncing...", msg_saved: "Success! Reloading...", msg_err: "Sync Error",
                   backup_restore_title: "Backup & Restore", ping_test_title: "Latency Diagnostics", ping_test_desc: "Test response time to your active node target."
               },
               fa: {
                   title: "دروازه نهان", pass_ph: "کلید اصلی", login_btn: "ورود به سیستم", err_pass: "دسترسی مسدود شد", missing_db: "⚠️ فضای IOT_DB یافت نشد! تنظیمات ذخیره نمی‌شوند.",
-                  logout: "خروج", tab_info: "نقاط اتصال", tab_status: "وضعیت شبکه", tab_settings: "تنظیمات پایه", tab_adv: "پیشرفته",
+                  logout: "خروج", tab_info: "نقاط اتصال", tab_status: "وضعیت شبکه", tab_settings: "تنظیمات پایه", tab_adv: "پیشرفته", tab_logs: "گزارش فعالیت",
                   qr_title: "لینک اتصال مستقیم", badge_multi: "ترکیب دوگانه V+T", copy: "کپی", copied: "در حافظه کپی شد!", sync_link: "لینک ساب (Cloud Sync)", active_id: "شناسه سخت‌افزار",
                   stat_ip: "آی‌پی مبدا", stat_dc: "گره لبه", stat_loc: "منطقه داده",
                   lbl_proto: "پروتکل نمایش مستقیم", lbl_port: "پورت داده", lbl_id: "شناسه یکتا (خالی=خودکار)",
                   lbl_path: "مسیر مخفی API", lbl_pass: "کلید اصلی", lbl_fp: "امضای TLS", lbl_dns: "آی‌پی تحلیلگر",
+                  lbl_profiles: "پروفایل‌های سنسور (کاربر چندگانه)", ph_profiles: "uuid1:User1\\nuuid2:User2", desc_profiles: "فرمت uuid:اسم است. لینک ساب یکتا با افزودن ?sub=name به لینک اصلی ایجاد می‌شود.",
                   lbl_clean_ips: "آی‌پی‌های تمیز (مولد چندگانه)", ph_clean_ips: "1.1.1.1, 2.2.2.2", desc_clean_ips: "آی‌پی ها را با کاما یا خط جدید جدا کنید. لینک ساب برای همه ترکیب می‌سازد.",
                   lbl_fake: "سایت‌های استتار (حالت مخفی)", lbl_tfo: "اتصال سریع (TFO)", lbl_ech: "سلام امن (ECH)", lbl_tg_token: "توکن ربات تلگرام", lbl_tg_chat: "آیدی عددی تلگرام (Chat ID)", desc_tg_bot: "با تنظیم این مقادیر، جزئیات ورود به پنل به تلگرام ارسال می‌شود.",
                   lbl_cf_acc: "آیدی اکانت کلودفلر (Account ID)", lbl_cf_token: "توکن کلودفلر (API Token)", desc_cf_api: "اختیاری: برای نمایش میزان مصرف روزانه کارگر از 100 هزار درخواست رایگان در پیام‌های تلگرام.",
+                  lbl_silent: "هشدار و پیغام خاموش", lbl_pause: "کلید توقف اضطراری",
                   save_btn: "ذخیره تنظیمات", msg_saving: "در حال ثبت...", msg_saved: "موفق! در حال بارگذاری...", msg_err: "خطای ارتباط",
                   backup_restore_title: "پشتیبان‌گیری و بازیابی", ping_test_title: "عیب‌یابی تاخیر شبکه", ping_test_desc: "تاخیر پاسخ‌دهی را به آی‌پی تمیز فعال اندازه بگیرید."
               }
@@ -896,7 +1077,7 @@ function getDashboardUI(hasDB) {
           }
   
           function switchTab(tab) {
-              ['info','network','settings','advanced'].forEach(t => {
+            ['info','network','settings','advanced','logs'].forEach(t => {
                   const view = document.getElementById('view-'+t);
                   const deskBtn = document.getElementById('tab-'+t);
                   const mobBtn = document.getElementById('mob-tab-'+t);
@@ -908,8 +1089,35 @@ function getDashboardUI(hasDB) {
                       deskBtn.classList.remove('active'); mobBtn.classList.remove('active');
                   }
               });
-              updateTitle();
-          }
+            updateTitle();
+            if(tab === 'logs') loadLogs();
+        }
+
+        async function loadLogs() {
+            const container = document.getElementById('logs-container');
+            if(!container) return;
+            container.innerHTML = '<p class="text-sm text-slate-400 text-center py-4">Loading logs...</p>';
+            try {
+                const res = await fetch(baseRoute + '/api/logs', { method: 'POST', body: JSON.stringify({ key: sessionKey }) });
+                const data = await res.json();
+                if (data.success && data.logs) {
+                    container.innerHTML = '';
+                    if (data.logs.length === 0) {
+                        container.innerHTML = '<p class="text-sm text-slate-400 text-center py-4">No activity logs found.</p>';
+                        return;
+                    }
+                    data.logs.forEach(log => {
+                        const dateStr = new Date(log.ts).toLocaleString('en-US', {hour12: false});
+                        const html = \`<div class="flex flex-col sm:flex-row sm:items-center justify-between p-3 bg-slate-50 dark:bg-slate-800 rounded-xl border border-slate-100 dark:border-darkborder/50 gap-2"><div><p class="text-sm font-bold text-slate-700 dark:text-slate-200">\${log.type}</p><p class="text-xs text-slate-500 truncate max-w-[200px] sm:max-w-xs" title="\${log.detail}">\${log.detail}</p></div><span class="text-[10px] font-mono text-slate-400 bg-white dark:bg-darkcard px-2 py-1 rounded shrink-0">\${dateStr}</span></div>\`;
+                        container.insertAdjacentHTML('beforeend', html);
+                    });
+                } else {
+                    container.innerHTML = '<p class="text-sm text-red-400 text-center py-4">Failed to load logs.</p>';
+                }
+            } catch (err) {
+                container.innerHTML = '<p class="text-sm text-red-400 text-center py-4">Error loading logs.</p>';
+            }
+        }
   
           function copyData(id) {
               const input = document.getElementById(id); input.select(); navigator.clipboard.writeText(input.value);
@@ -955,10 +1163,11 @@ function getDashboardUI(hasDB) {
               const payload = {
                   mode: el('cfg-proto').value, socketPort: el('cfg-port').value, deviceId: el('cfg-uuid').value,
                   apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, agent: el('cfg-fp').value,
-                  resolveIp: el('cfg-dns').value, cleanIps: el('cfg-ips').value, maintenanceHost: el('cfg-fake').value,
+                  resolveIp: el('cfg-dns').value, cleanIps: el('cfg-ips').value, extraProfiles: el('cfg-profiles').value, maintenanceHost: el('cfg-fake').value,
                   enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked,
                   tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value,
-                  cfAccountId: el('cfg-cf-acc').value, cfApiToken: el('cfg-cf-token').value
+                  cfAccountId: el('cfg-cf-acc').value, cfApiToken: el('cfg-cf-token').value,
+                  isPaused: el('cfg-pause').checked, silentAlerts: el('cfg-silent').checked
               };
               const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(payload, null, 2));
               const dlAnchor = document.createElement('a');
@@ -994,6 +1203,8 @@ function getDashboardUI(hasDB) {
                       
                       if (conf.enableOpt1 !== undefined) document.getElementById('cfg-tfo').checked = conf.enableOpt1;
                       if (conf.enableOpt2 !== undefined) document.getElementById('cfg-ech').checked = conf.enableOpt2;
+                      if (conf.isPaused !== undefined) document.getElementById('cfg-pause').checked = conf.isPaused;
+                      if (conf.silentAlerts !== undefined) document.getElementById('cfg-silent').checked = conf.silentAlerts;
                       
                       updateUI();
                       alert(lang === 'fa' ? 'پیکربندی با موفقیت وارد شد! روی ذخیره کلیک کنید.' : 'Configuration parsed! Click save to write changes.');
@@ -1069,6 +1280,7 @@ function getDashboardUI(hasDB) {
                       document.getElementById('cfg-fp').value = conf.agent || 'chrome';
                       document.getElementById('cfg-dns').value = conf.resolveIp || '';
                       document.getElementById('cfg-ips').value = conf.cleanIps || '';
+                      document.getElementById('cfg-profiles').value = conf.extraProfiles || '';
                       document.getElementById('cfg-fake').value = conf.maintenanceHost || '';
                       document.getElementById('cfg-tfo').checked = conf.enableOpt1 || false;
                       document.getElementById('cfg-ech').checked = conf.enableOpt2 || false;
@@ -1076,8 +1288,10 @@ function getDashboardUI(hasDB) {
                       document.getElementById('cfg-tg-chat').value = conf.tgChatId || '';
                       document.getElementById('cfg-cf-acc').value = conf.cfAccountId || '';
                       document.getElementById('cfg-cf-token').value = conf.cfApiToken || '';
+                      document.getElementById('cfg-pause').checked = conf.isPaused || false;
+                      document.getElementById('cfg-silent').checked = conf.silentAlerts || false;
   
-                      ['cfg-proto','cfg-port','cfg-fp','cfg-ips','cfg-path'].forEach(id => {
+                      ['cfg-proto','cfg-port','cfg-fp','cfg-ips','cfg-profiles','cfg-path'].forEach(id => {
                           const el = document.getElementById(id);
                           if(el) { el.addEventListener('input', updateUI); el.addEventListener('change', updateUI); }
                       });
@@ -1106,7 +1320,8 @@ function getDashboardUI(hasDB) {
                       resolveIp: el('cfg-dns').value, cleanIps: el('cfg-ips').value, maintenanceHost: el('cfg-fake').value,
                       enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked,
                       tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value,
-                      cfAccountId: el('cfg-cf-acc').value, cfApiToken: el('cfg-cf-token').value
+                      cfAccountId: el('cfg-cf-acc').value, cfApiToken: el('cfg-cf-token').value,
+                      isPaused: el('cfg-pause').checked, silentAlerts: el('cfg-silent').checked
                   }
               };
               const stat = el('save-status'); stat.textContent = i18n[lang].msg_saving; stat.className = "text-sm font-bold text-primary animate-pulse md:me-4";
