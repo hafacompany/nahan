@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "2.3.0";
+const CURRENT_VERSION = "2.3.1";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -127,6 +127,27 @@ function trackUsage(uuid, bytes, env, ctx) {
     if (now - lastSysUsageSync > 30000) {
         lastSysUsageSync = now;
         if (env && env.IOT_DB) {
+            let changedConfig = false;
+            if (sysConfig.users && sysConfig.users.length > 0) {
+                const initialLen = sysConfig.users.length;
+                sysConfig.users = sysConfig.users.filter(u => {
+                    let uId = u.id.replace(/-/g, '').toLowerCase();
+                    let sysU = sysUsageCache.users[uId];
+                    if (sysU) {
+                        if (u.limitTotalReq && sysU.reqs >= u.limitTotalReq) return false;
+                        if (u.limitDailyReq && sysU.lastDay === new Date().toISOString().split('T')[0] && sysU.dReqs >= u.limitDailyReq) return false;
+                    }
+                    if (u.expiryMs && now > u.expiryMs) return false;
+                    return true;
+                });
+                if (sysConfig.users.length !== initialLen) {
+                    changedConfig = true;
+                }
+            }
+            
+            if (changedConfig) {
+                ctx?.waitUntil(d1Put(env, "sys_config", JSON.stringify(sysConfig)).catch(()=>{}));
+            }
             ctx?.waitUntil(d1Put(env, "sys_usage", JSON.stringify(sysUsageCache)).catch(()=>{}));
         }
     }
@@ -793,7 +814,7 @@ function buildUriProfile(hostName, targetSub = null) {
                 let extBase = `encryption=none&security=${sec}&sni=${hName}&fp=${sysConfig.agent}&type=ws&host=${hName}&path=${reqPath}`;
                 if (sysConfig.enableOpt2) extBase += `&pbk=enabled`;
                 ips.forEach(ip => {
-                    let nameExt = p.name === "Default" ? `[${ip}:${port}]` : `[${ip}:${port}]-${p.name}`;
+                    let nameExt = p.name === "Default" ? `${port}` : `${port}-${p.name}`;
                     let vName = `V-Core-${nameExt}`;
                     let tName = `T-Core-${nameExt}`;
                     
@@ -825,7 +846,7 @@ function buildYamlProfile(hostName, targetSub = null) {
             ports.forEach(port => {
                 let sec = getTransportParams(port) === "tls" ? "true" : "false";
                 ips.forEach(ip => {
-                    let nameExt = p.name === "Default" ? `[${ip}:${port}]` : `[${ip}:${port}]-${p.name}`;
+                    let nameExt = p.name === "Default" ? `${port}` : `${port}-${p.name}`;
                     
                     if (sysConfig.mode === "alpha" || sysConfig.mode === "both") {
                         let vName = `V-Core-${nameExt}`;
@@ -1087,7 +1108,10 @@ function getDashboardUI(hasDB) {
                                   </select>
                               </div>
                               <div class="space-y-1 md:col-span-2">
-                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_id">Device UUID (Empty=Auto)</label>
+                                  <div class="flex justify-between items-center">
+                                      <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_id">Device UUID (Empty=Auto)</label>
+                                      <button type="button" onclick="document.getElementById('cfg-uuid').value = crypto.randomUUID()" class="text-xs text-primary bg-primary/10 hover:bg-primary/20 px-2 py-1 rounded transition-colors duration-200">Generate UUID</button>
+                                  </div>
                                   <input type="text" id="cfg-uuid" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none font-mono text-sm">
                               </div>
                               <div class="space-y-1">
@@ -2015,9 +2039,9 @@ function getDashboardUI(hasDB) {
                   if (remoteVer) {
                       const strip = v => v.replace(/^v/, '').trim();
                       const rVer = strip(remoteVer);
-                      const cVer = strip("2.3.0");
+                      const cVer = strip("2.3.1");
                       
-                      if (rVer && rVer > cVer) {
+                      if (rVer && rVer !== cVer) {
                           showUpdateBanner(repo, rVer);
                       }
                   }
