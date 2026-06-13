@@ -969,9 +969,9 @@ async function handleStatsApi(request, env) {
         const users = sysConfig.users || [];
         const totalUsers = users.length;
         const activeUsers = users.filter(u => !u.isPaused && (!u.expiryMs || Date.now() <= u.expiryMs)).length;
-        const pausedUsers = users.filter(u => u.isPaused).length;
-        const expiredUsers = users.filter(u => u.expiryMs && Date.now() > u.expiryMs).length;
         const autoDisabledUsers = users.filter(u => u.isPaused && u.disabledReason).length;
+        const pausedUsers = users.filter(u => u.isPaused && !u.disabledReason).length;
+        const expiredUsers = users.filter(u => u.expiryMs && Date.now() > u.expiryMs && !u.isPaused).length;
 
         let totalTrafficReqs = 0;
         let dailyTrafficReqs = 0;
@@ -1158,6 +1158,23 @@ const botI18n = {
         msg_no_disabled: "No disabled users found.",
         msg_enter_device_limit: "📱 Enter device limit (0 for unlimited):",
         stats_title: "📈 Panel Statistics",
+        count_active: "active",
+        count_paused: "paused",
+        count_disabled: "auto-disabled",
+        dash_total: "Total Users",
+        dash_active: "Active",
+        dash_paused: "Paused",
+        dash_expired: "Expired",
+        dash_auto_disabled: "Auto-Disabled",
+        btn_main_menu: "🔙 Main Menu",
+        btn_back_to_list: "🔙 Back to List",
+        total_traffic: "Total Traffic",
+        daily_traffic: "Daily Traffic",
+        lbl_status: "Status",
+        lbl_subscription: "Subscription Connection",
+        lbl_user_not_found: "⚠️ User not found",
+        lbl_none: "None",
+        lbl_page: "Page",
     },
     fa: {
         welcome: "🤖 **به ربات ترانزیت نهان خوش آمدید**\nجهت مدیریت سیستم نظارتی خود یکی از گزینه‌های زیر را انتخاب نمایید:",
@@ -1217,6 +1234,23 @@ const botI18n = {
         msg_no_disabled: "هیچ کاربر غیرفعالی یافت نشد.",
         msg_enter_device_limit: "📱 محدودیت دستگاه را وارد کنید (0 برای نامحدود):",
         stats_title: "📈 آمار پنل",
+        count_active: "فعال",
+        count_paused: "متوقف",
+        count_disabled: "غیرفعال خودکار",
+        dash_total: "کل کاربران",
+        dash_active: "فعال",
+        dash_paused: "متوقف",
+        dash_expired: "منقضی",
+        dash_auto_disabled: "غیرفعال خودکار",
+        btn_main_menu: "🔙 منوی اصلی",
+        btn_back_to_list: "🔙 بازگشت به لیست",
+        total_traffic: "ترافیک کل",
+        daily_traffic: "ترافیک روزانه",
+        lbl_status: "وضعیت",
+        lbl_subscription: "لینک اشتراک",
+        lbl_user_not_found: "⚠️ کاربر یافت نشد",
+        lbl_none: "ندارد",
+        lbl_page: "صفحه",
     }
 };
 
@@ -1285,11 +1319,12 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             const statusEmoji = isPaused ? "🔴" : "🟢";
             const users = sysConfig.users || [];
             const activeCount = users.filter(u => !u.isPaused && (!u.expiryMs || Date.now() <= u.expiryMs)).length;
-            const disabledCount = users.filter(u => u.isPaused).length;
+            const pausedCount = users.filter(u => u.isPaused && !u.disabledReason).length;
+            const autoDisabledCount = users.filter(u => u.isPaused && u.disabledReason).length;
             const text = `${t("welcome")}\n\n` +
                          `━━━━━━━━━━━━━━━━\n` +
                          `⚡ **${t("status")}**: ${isPaused ? t("paused") : t("active")} ${statusEmoji}\n` +
-                         `👥 **${t("users")}**: ${users.length} (${activeCount} active, ${disabledCount} paused)\n` +
+                         `👥 **${t("users")}**: ${users.length} (${activeCount} ${t("count_active")}, ${pausedCount} ${t("count_paused")}, ${autoDisabledCount} ${t("count_disabled")})\n` +
                          `━━━━━━━━━━━━━━━━`;
             const panelUrl = `https://${hostName}/${encodeURI(sysConfig.apiRoute)}/dash`;
             const kb = {
@@ -1307,7 +1342,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     ],
                     [
                         { text: `🌐 ${langCode === 'fa' ? 'English 🇺🇸' : 'فارسی 🇮🇷'}`, callback_data: "sys_lang" },
-                        { text: isPaused ? "▶️ Resume" : "⏸️ Pause", callback_data: "sys_toggle_status" }
+                        { text: isPaused ? t("btn_resume") : t("btn_pause"), callback_data: "sys_toggle_status" }
                     ],
                     [
                         { text: `🔑 ${t("dash")}`, web_app: { url: panelUrl } },
@@ -1329,7 +1364,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             const end = start + itemsPerPage;
             const pageUsers = users.slice(start, end);
             
-            let text = `👥 **${t("users")}** (Page ${page + 1}/${Math.max(1, totalPages)})\n`;
+            let text = `👥 **${t("users")}** (${t("lbl_page")} ${page + 1}/${Math.max(1, totalPages)})\n`;
             text += `━━━━━━━━━━━━━━━━\n`;
             
             if (users.length === 0) {
@@ -1358,7 +1393,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             }
             
             inline_keyboard.push([{ text: `➕ ${t("btn_add")}`, callback_data: "sub_add_init" }]);
-            inline_keyboard.push([{ text: "🔙 Main Menu", callback_data: "main_menu" }]);
+            inline_keyboard.push([{ text: t("btn_main_menu"), callback_data: "main_menu" }]);
             
             return { text, kb: { inline_keyboard } };
         };
@@ -1367,7 +1402,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             const users = sysConfig.users || [];
             const u = users.find(usr => usr.id === uuid);
             if (!u) {
-                return { text: "⚠️ User not found", kb: { inline_keyboard: [[{ text: "Back", callback_data: "subs_list:0" }]] } };
+                return { text: "⚠️ User not found", kb: { inline_keyboard: [[{ text: t("btn_back"), callback_data: "subs_list:0" }]] } };
             }
             
             const sysU = sysUsageCache?.users?.[u.id.replace(/-/g,'').toLowerCase()] || { reqs: 0, dReqs: 0, lastDay: '' };
@@ -1389,22 +1424,22 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 const remDays = Math.ceil((u.expiryMs - Date.now()) / 86400000);
                 daysLeft = remDays >= 0 ? `${remDays}` : '0';
                 if (Date.now() > u.expiryMs) {
-                    expTxt += ` (${langCode === 'fa' ? 'منقضی شده 🔴' : 'Expired 🔴'})`;
+                    expTxt += ` (${t("dash_expired")} 🔴)`;
                     isExp = true;
                 }
             }
             
             const statusEmoji = u.isPaused ? "⏸️" : (isExp ? "🔴" : "🟢");
-            const statusText = u.isPaused ? t("paused") : (isExp ? (langCode==='fa'?'منقضی':'Expired') : t("active"));
+            const statusText = u.isPaused ? t("paused") : (isExp ? t("dash_expired") : t("active"));
             const subSync = `https://${hostName}/${sysConfig.apiRoute}?sub=${encodeURIComponent(u.name)}`;
             const maxCfgTxt = u.maxConfigs || t("unlimited");
-            const notesTxt = u.notes || (langCode === 'fa' ? 'ندارد' : 'None');
+            const notesTxt = u.notes || t("lbl_none");
             
             let text = `👤 **${t("sub_info")}**\n`;
             text += `━━━━━━━━━━━━━━━━\n`;
             text += `📛 **${t("name")}**: ${u.name}\n`;
             text += `🆔 **UUID**: <code>${u.id}</code>\n`;
-            text += `🚦 **Status**: ${statusEmoji} ${statusText}\n`;
+            text += `🚦 **${t("lbl_status")}**: ${statusEmoji} ${statusText}\n`;
             text += `📊 **${t("total")}**: ${usedGB} GB / ${limitGB} GB (${userReqs} reqs)\n`;
             text += `⏱ **${t("daily")}**: ${userDReqs} / ${limitDailyTxt}\n`;
             text += `📅 **${t("expiry")}**: ${expTxt}\n`;
@@ -1412,7 +1447,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             text += `📱 **${t("device_limit")}**: ${maxCfgTxt}\n`;
             text += `📝 **${t("notes")}**: ${notesTxt}\n`;
             text += `━━━━━━━━━━━━━━━━\n`;
-            text += `🔗 **Subscription Connection:**\n<code>${subSync}</code>`;
+            text += `🔗 **${t("lbl_subscription")}:**\n<code>${subSync}</code>`;
             
             const kb = {
                 inline_keyboard: [
@@ -1433,7 +1468,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         { text: `📱 ${t("device_limit")}`, callback_data: `sub_edit_device_init:${u.id}` }
                     ],
                     [
-                        { text: "🔙 Back to List", callback_data: "subs_list:0" }
+                        { text: t("btn_back_to_list"), callback_data: "subs_list:0" }
                     ]
                 ]
             };
@@ -1484,7 +1519,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     text += `📊 **Cloudflare API Usage**: ${usageStr}\n`;
                     text += `━━━━━━━━━━━━━━━━`;
                     
-                    const kb = { inline_keyboard: [[{ text: `🔙 Main Menu`, callback_data: "main_menu" }]] };
+                    const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
                     await sendOrEdit(chatId, text, kb, messageId);
                 } else if (data.startsWith("subs_list:")) {
                     const page = parseInt(data.replace("subs_list:", "")) || 0;
@@ -1612,29 +1647,29 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     sysConfig.isPaused = true;
                     await d1Put(env, "sys_config", JSON.stringify(sysConfig));
                     const successText = `${t("msg_panic")}\n\n🔑 New Secret Path Randomized. All old sessions revoked.`;
-                    const kb = { inline_keyboard: [[{ text: `🔙 Main Menu`, callback_data: "main_menu" }]] };
+                    const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
                     await sendOrEdit(chatId, successText, kb, messageId);
                 } else if (data === "sys_dashboard") {
                     const users = sysConfig.users || [];
                     const activeCount = users.filter(u => !u.isPaused && (!u.expiryMs || Date.now() <= u.expiryMs)).length;
-                    const disabledCount = users.filter(u => u.isPaused).length;
-                    const expiredCount = users.filter(u => u.expiryMs && Date.now() > u.expiryMs).length;
+                    const pausedCount = users.filter(u => u.isPaused && !u.disabledReason).length;
+                    const expiredCount = users.filter(u => u.expiryMs && Date.now() > u.expiryMs && !u.isPaused).length;
                     const autoDisabledCount = users.filter(u => u.isPaused && u.disabledReason).length;
                     const upSeconds = Math.floor((Date.now() - isolateStartTime) / 1000);
                     const dh = Math.floor(upSeconds / 3600);
                     const dm = Math.floor((upSeconds % 3600) / 60);
                     let dashText = `📊 **${t("dashboard")}**\n`;
                     dashText += `━━━━━━━━━━━━━━━━\n`;
-                    dashText += `👥 **Total Users**: ${users.length}\n`;
-                    dashText += `🟢 **Active**: ${activeCount}\n`;
-                    dashText += `⏸️ **Paused**: ${disabledCount}\n`;
-                    dashText += `🔴 **Expired**: ${expiredCount}\n`;
-                    dashText += `🚫 **Auto-Disabled**: ${autoDisabledCount}\n`;
+                    dashText += `👥 **${t("dash_total")}**: ${users.length}\n`;
+                    dashText += `🟢 **${t("dash_active")}**: ${activeCount}\n`;
+                    dashText += `⏸️ **${t("dash_paused")}**: ${pausedCount}\n`;
+                    dashText += `🔴 **${t("dash_expired")}**: ${expiredCount}\n`;
+                    dashText += `🚫 **${t("dash_auto_disabled")}**: ${autoDisabledCount}\n`;
                     dashText += `⏱ **${t("uptime")}**: ${dh}h ${dm}m\n`;
                     dashText += `🔌 **${t("streams")}**: ${activeConnections}\n`;
                     dashText += `⚡ **System**: ${sysConfig.isPaused ? t("paused") : t("active")}\n`;
                     dashText += `━━━━━━━━━━━━━━━━`;
-                    const kb = { inline_keyboard: [[{ text: `🔙 Main Menu`, callback_data: "main_menu" }]] };
+                    const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
                     await sendOrEdit(chatId, dashText, kb, messageId);
                 } else if (data === "sys_stats") {
                     const users = sysConfig.users || [];
@@ -1649,11 +1684,11 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     });
                     let statsText = `📈 **${t("stats_title")}**\n`;
                     statsText += `━━━━━━━━━━━━━━━━\n`;
-                    statsText += `👥 **Total Users**: ${users.length}\n`;
-                    statsText += `📊 **Total Traffic**: ${(totalReqs / 6000).toFixed(2)} GB\n`;
-                    statsText += `📅 **Daily Traffic**: ${(dailyReqs / 6000).toFixed(2)} GB\n`;
+                    statsText += `👥 **${t("dash_total")}**: ${users.length}\n`;
+                    statsText += `📊 **${t("total_traffic")}**: ${(totalReqs / 6000).toFixed(2)} GB\n`;
+                    statsText += `📅 **${t("daily_traffic")}**: ${(dailyReqs / 6000).toFixed(2)} GB\n`;
                     statsText += `━━━━━━━━━━━━━━━━`;
-                    const kb = { inline_keyboard: [[{ text: `🔙 Main Menu`, callback_data: "main_menu" }]] };
+                    const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
                     await sendOrEdit(chatId, statsText, kb, messageId);
                 } else if (data === "sys_panel_info") {
                     let infoText = `ℹ️ **${t("panel_info")}**\n`;
@@ -1664,13 +1699,13 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     infoText += `🔒 **Ports**: ${sysConfig.socketPorts || '443'}\n`;
                     infoText += `📱 **Version**: ${CURRENT_VERSION}\n`;
                     infoText += `━━━━━━━━━━━━━━━━`;
-                    const kb = { inline_keyboard: [[{ text: `🔙 Main Menu`, callback_data: "main_menu" }]] };
+                    const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
                     await sendOrEdit(chatId, infoText, kb, messageId);
                 } else if (data.startsWith("subs_disabled:")) {
                     const users = sysConfig.users || [];
                     const disabledUsers = users.filter(u => u.isPaused);
                     if (disabledUsers.length === 0) {
-                        const kb = { inline_keyboard: [[{ text: `🔙 Main Menu`, callback_data: "main_menu" }]] };
+                        const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
                         await sendOrEdit(chatId, `🚫 ${t("msg_no_disabled")}`, kb, messageId);
                     } else {
                         const page = parseInt(data.replace("subs_disabled:", "")) || 0;
@@ -1681,7 +1716,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         let text = `🚫 **${t("disabled_users")}** (${disabledUsers.length})\n━━━━━━━━━━━━━━━━\n`;
                         const inline_keyboard = [];
                         pageUsers.forEach((u) => {
-                            const reason = u.disabledReason || (langCode === 'fa' ? 'غیرفعال شده' : 'Paused');
+                            const reason = u.disabledReason || t("paused");
                             text += `👤 **${u.name}**\n   ${reason}\n`;
                             inline_keyboard.push([{ text: `▶️ ${u.name}`, callback_data: `sub_toggle:${u.id}` }]);
                         });
@@ -1689,7 +1724,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         if (page > 0) navRow.push({ text: `⬅️ ${t("btn_back")}`, callback_data: `subs_disabled:${page - 1}` });
                         if (end < disabledUsers.length) navRow.push({ text: `${t("btn_next")} ➡️`, callback_data: `subs_disabled:${page + 1}` });
                         if (navRow.length > 0) inline_keyboard.push(navRow);
-                        inline_keyboard.push([{ text: "🔙 Main Menu", callback_data: "main_menu" }]);
+                        inline_keyboard.push([{ text: t("btn_main_menu"), callback_data: "main_menu" }]);
                         await sendOrEdit(chatId, text, { inline_keyboard }, messageId);
                     }
                 } else if (data === "sub_search_init") {
@@ -1865,7 +1900,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         tgState[chatId] = null;
                         await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
                         if (results.length === 0) {
-                            const kb = { inline_keyboard: [[{ text: `🔙 Main Menu`, callback_data: "main_menu" }]] };
+                            const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
                             await sendOrEdit(chatId, `🔍 No users found for "${text}"`, kb);
                         } else {
                             let searchText = `🔍 **Search Results** (${results.length})\n━━━━━━━━━━━━━━━━\n`;
@@ -1875,7 +1910,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                                 searchText += `${statusEmoji} **${u.name}**\n`;
                                 inline_keyboard.push([{ text: `👤 ${u.name}`, callback_data: `sub_detail:${u.id}` }]);
                             });
-                            inline_keyboard.push([{ text: "🔙 Main Menu", callback_data: "main_menu" }]);
+                            inline_keyboard.push([{ text: t("btn_main_menu"), callback_data: "main_menu" }]);
                             await sendOrEdit(chatId, searchText, { inline_keyboard });
                         }
                         return new Response("OK", { status: 200 });
@@ -4795,8 +4830,9 @@ function getDashboardUI(hasDB) {
               // Calculate stats metrics
               let totalUsersVal = users.length;
               let activeSubscribers = users.filter(u => !u.isPaused && (!u.expiryMs || Date.now() <= u.expiryMs)).length;
-              let pausedSubscribers = users.filter(u => u.isPaused).length;
               let autoDisabledCount = users.filter(u => u.isPaused && u.disabledReason).length;
+              let pausedSubscribers = users.filter(u => u.isPaused && !u.disabledReason).length;
+              let expiredCount = users.filter(u => u.expiryMs && Date.now() > u.expiryMs && !u.isPaused).length;
               let totalReqsSum = 0;
               users.forEach(u => {
                   let sysU = usage[u.id.replace(/-/g,'').toLowerCase()] || {reqs: 0};
