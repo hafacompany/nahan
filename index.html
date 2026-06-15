@@ -223,7 +223,7 @@
                     <div class="space-y-2">
                         <h2 class="text-xl font-extrabold text-indigo-600 dark:text-indigo-400">ابزار اختصاصی دریافت و مبهم‌سازی کدهای ورکر</h2>
                         <p class="text-slate-600 dark:text-slate-400 text-xs sm:text-sm">
-                            در این بخش می‌توانید آخرین نسخه فایل اصلی را از گیت‌هاب دریافت کنید، آن را مشاهده نموده و در صورت تمایل با متود رمزنگاری منحصربه‌فرد، مبهم‌سازی (Obfuscate) کنید.
+                            در این بخش می‌توانید آخرین نسخه فایل اصلی را از گیت‌هاب دریافت کنید، آن را مشاهده نموده و با متود رمزنگاری پیشرفته یونیکد UTF-8، مبهم‌سازی (Obfuscate) کنید.
                         </p>
                     </div>
 
@@ -265,9 +265,9 @@
 
                         <!-- Educational Banner on Obfuscation -->
                         <div class="p-4 bg-slate-50 dark:bg-slate-950 rounded-xl border border-slate-250 dark:border-slate-850 text-xs text-slate-500 dark:text-slate-400 space-y-2 leading-relaxed">
-                            <h4 class="font-bold text-slate-700 dark:text-slate-300">💡 مکانیزم فنی مبهم‌سازی پویای نهان چطور کار می‌کند؟</h4>
+                            <h4 class="font-bold text-slate-700 dark:text-slate-300">💡 مکانیزم فنی مبهم‌سازی بایت‌شفتینگ UTF-8 چطور کار می‌کند؟</h4>
                             <p>
-                                کدهای ورکر به صورت بیت‌به‌بیت با یک کلید تصادفیِ ریاضی، **XOR معکوس** می‌شوند و پس از حذف ایمپورت‌های ماژولار غیرمجاز، به یک فرمت ارزیابی مجزا (Evaluated function context) در کلودفلر تبدیل می‌گردند. این فرآیند مانع تشخیص و اسکن مستقیم کدهای ورکر توسط روتین‌های فیلترینگ و اسکنرهای ماشینی می‌شود، در حالی که در محیط Cloudflare Workers با حداکثر سرعت و بدون مصرف پردازش اضافی (CPU usage) اجرا می‌گردد.
+                                کدهای ورودی ابتدا با موتور پردازش بومی مرورگر (`TextEncoder`) به آرایه‌ای از بایت‌های باینری استاندارد UTF-8 (بازه مقادیر عددی ثابت بین ۰ تا ۲۵۵) کامپایل می‌شوند. این متود امکان بروز هرگونه تداخل یا Syntax Error در کاراکترهای چندبایتی فارسی، امضاها یا ایموجی‌های داخل سورس‌کد را به طور کامل از بین می‌برد. پس از اتمام عملگر رمزنگاری XOR، رشته نهایی در کلاینت کلودفلر توسط کلاس پرسرعت `TextDecoder` رمزگشایی شده و به صورت مستقل اجرا می‌گردد.
                             </p>
                         </div>
                     </div>
@@ -279,7 +279,7 @@
 
     <!-- Toast Success Notification -->
     <div id="toast" class="fixed bottom-6 left-1/2 -translate-x-1/2 px-5 py-3 bg-emerald-600 text-white rounded-xl text-xs shadow-xl opacity-0 transition-opacity duration-350 pointer-events-none font-bold">
-        با موفقیت کپی شد!
+        با موفقیت انجام شد!
     </div>
 
     <script>
@@ -337,7 +337,7 @@
             }
         }
 
-        // Custom Unique XOR compiler for Cloudflare Modules
+        // Custom Unique UTF-8 Byte XOR compiler for Cloudflare Modules
         function obfuscateSourceCode() {
             const srcText = document.getElementById('original-code-area').value;
             if(!srcText || srcText.trim().length === 0 || srcText.startsWith("کدهای ورکر را اینجا")) {
@@ -355,27 +355,32 @@
                 // 3. Key generations
                 const randKey = Math.floor(Math.random() * 80) + 64; 
                 
-                // 4. Bit-XOR shifting loop to hex blocks
+                // 4. Encode directly to UTF-8 Byte Array first
+                const encoder = new TextEncoder();
+                const bytes = encoder.encode(cleanCode);
+                
+                // 5. Bit-XOR shifting loop to hex blocks (guaranteed to be 2 hex characters)
                 let hexOutput = '';
-                for (let i = 0; i < cleanCode.length; i++) {
-                    const characterCode = cleanCode.charCodeAt(i) ^ randKey;
-                    hexOutput += characterCode.toString(16).padStart(2, '0');
+                for (let i = 0; i < bytes.length; i++) {
+                    const xorByte = bytes[i] ^ randKey;
+                    hexOutput += xorByte.toString(16).padStart(2, '0');
                 }
                 
-                // 5. Structure the native Workers environment bypass template
+                // 6. Structure the native Workers environment bypass template using TextDecoder
                 const finalLoaderCode = `import { connect } from "cloudflare:sockets";
 
 // Nahan Gateway - Obfuscated Loader Context (v2.5.4 Optimized)
 const _0xNahanPayload = "${hexOutput}";
 const _0xNahanKey = ${randKey};
 
-const _0xNahanCode = _0xNahanPayload.match(/.{1,2}/g).map(x => String.fromCharCode(parseInt(x, 16) ^ _0xNahanKey)).join('');
+const _0xNahanBytes = new Uint8Array(_0xNahanPayload.match(/.{1,2}/g).map(x => parseInt(x, 16) ^ _0xNahanKey));
+const _0xNahanCode = new TextDecoder().decode(_0xNahanBytes);
 const _0xNahanRuntime = new Function("connect", _0xNahanCode)(connect);
 
 export default _0xNahanRuntime;`;
 
                 document.getElementById('obfuscated-code-area').value = finalLoaderCode;
-                showToast("کد شما با متود اختصاصی با موفقیت مبهم‌سازی شد!");
+                showToast("کد شما با متود پیشرفته UTF-8 با موفقیت مبهم‌سازی شد!");
             } catch(err) {
                 alert("خطایی در بهینه‌سازی کدهای ورودی رخ داد: " + err.message);
             }
