@@ -75,6 +75,8 @@
         "final": "dns-remote",
         "strategy": "prefer_ipv4",
         "cache_capacity": 4096,
+        "optimistic": true,
+        "timeout": "10s",
         "reverse_mapping": true
     },
     "inbounds": [
