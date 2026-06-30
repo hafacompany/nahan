@@ -4187,6 +4187,7 @@ async function buildYamlProfile(hostName, targetSub = null, allowInsecure = fals
     let profiles = getAllProfiles(targetSub);
     let allHostNames = [...new Set(profiles.flatMap(p => getProfileHostNames(hostName, p)))];
     await preloadIpFlags(profiles, allHostNames);
+    let proxyGeoInfo = new Map(); // proxyName -> {country, flag}
 
     // Add fake configs
     let fakeNames = getFakeConfigNames(targetSub);
@@ -4239,6 +4240,7 @@ async function buildYamlProfile(hostName, targetSub = null, allowInsecure = fals
                         let vName = getConfigName("alpha", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName);
                         vName = getUniqueName(vName);
                         proxyNames.push(`"${vName}"`);
+                        proxyGeoInfo.set(vName, getGeoInfo(selectedProxyIp || ip));
                         let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
                         let payloadVl = { junk: randomJunk, protocol: "vl", mode: "proxyip", panelIPs: [] };
                         let pathStrVl = "/" + btoa(JSON.stringify(payloadVl));
@@ -4250,6 +4252,7 @@ async function buildYamlProfile(hostName, targetSub = null, allowInsecure = fals
                         let tName = getConfigName("beta", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName);
                         tName = getUniqueName(tName);
                         proxyNames.push(`"${tName}"`);
+                        proxyGeoInfo.set(tName, getGeoInfo(selectedProxyIp || ip));
                         let randomJunkTr = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
                         let payloadTr = { junk: randomJunkTr, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: configIndex };
                         let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
@@ -4261,6 +4264,7 @@ async function buildYamlProfile(hostName, targetSub = null, allowInsecure = fals
                         if (effectiveMode === "alpha" || effectiveMode === "both") {
                             let dvName = getUniqueName(getConfigName("alpha", p.name, port, hName, ip, null, dcIndex, ipName));
                             proxyNames.push(`"${dvName}"`);
+                            proxyGeoInfo.set(dvName, getGeoInfo(ip));
                             let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
                             let payloadVl = { junk: randomJunk, protocol: "vl", mode: "proxyip", panelIPs: [] };
                             let pathStrVl = "/" + btoa(JSON.stringify(payloadVl));
@@ -4271,6 +4275,7 @@ async function buildYamlProfile(hostName, targetSub = null, allowInsecure = fals
                         if (effectiveMode === "beta" || effectiveMode === "both") {
                             let dtName = getUniqueName(getConfigName("beta", p.name, port, hName, ip, null, dcIndex, ipName));
                             proxyNames.push(`"${dtName}"`);
+                            proxyGeoInfo.set(dtName, getGeoInfo(ip));
                             let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
                             let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: configIndex };
                             let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
@@ -4286,8 +4291,53 @@ async function buildYamlProfile(hostName, targetSub = null, allowInsecure = fals
         });
     });
 
-    let bestPingProxies = proxyNames.map(n => `      - ${n}`).join('\n');
-    let allProxies = proxyNames.map(n => `      - ${n}`).join('\n');
+    // Build per-country groups from geo info
+    let countryGroups = new Map(); // "country" -> {flag, proxies[]}
+    proxyGeoInfo.forEach((geo, name) => {
+        let key = geo.country || "Unknown";
+        if (!countryGroups.has(key)) {
+            countryGroups.set(key, { flag: geo.flag || "🌐", proxies: [] });
+        }
+        countryGroups.get(key).proxies.push(name);
+    });
+    let sortedCountries = Array.from(countryGroups.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+
+    // Build proxy-groups YAML
+    let groupsYaml = "proxy-groups:\n" +
+        '  - name: "✅ Selector"\n' +
+        "    type: select\n" +
+        "    proxies:\n" +
+        '      - "⚡ Fastest"\n' +
+        '      - "🖐 Manual"\n';
+    sortedCountries.forEach(([country, info]) => {
+        groupsYaml += `      - "${info.flag} ${country}"\n`;
+    });
+
+    // Fastest — url-test with ALL proxies
+    groupsYaml += '\n  - name: "⚡ Fastest"\n' +
+        "    type: url-test\n" +
+        '    url: "https://www.gstatic.com/generate_204"\n' +
+        "    interval: 30\n" +
+        "    tolerance: 50\n" +
+        "    proxies:\n";
+    proxyNames.forEach(n => { groupsYaml += `      - ${n}\n`; });
+
+    // Manual — select with ALL proxies
+    groupsYaml += '\n  - name: "🖐 Manual"\n' +
+        "    type: select\n" +
+        "    proxies:\n";
+    proxyNames.forEach(n => { groupsYaml += `      - ${n}\n`; });
+
+    // Per-country url-test groups
+    sortedCountries.forEach(([country, info]) => {
+        groupsYaml += `\n  - name: "${info.flag} ${country}"\n` +
+            "    type: url-test\n" +
+            '    url: "https://www.gstatic.com/generate_204"\n' +
+            "    interval: 30\n" +
+            "    tolerance: 50\n" +
+            "    proxies:\n";
+        info.proxies.forEach(name => { groupsYaml += `      - "${name}"\n`; });
+    });
 
     return `mixed-port: 7890
 ipv6: true
@@ -4355,20 +4405,7 @@ sniffer:
 proxies:
 ${proxies.join('\n')}
 
-proxy-groups:
-  - name: "✅ Selector"
-    type: select
-    proxies:
-      - "💦 Best Ping 🚀"
-${fakeRefs.map(n => `      - ${n}`).join('\n')}
-${allProxies}
-  - name: "💦 Best Ping 🚀"
-    type: url-test
-    url: "https://www.gstatic.com/generate_204"
-    interval: 30
-    tolerance: 50
-    proxies:
-${bestPingProxies}
+${groupsYaml}
 
 rules:
   - DOMAIN-SUFFIX,ir,DIRECT
@@ -4397,6 +4434,7 @@ async function buildClashJsonProfile(hostName, targetSub = null, allowInsecure =
     let profiles = getAllProfiles(targetSub);
     let allHostNames = [...new Set(profiles.flatMap(p => getProfileHostNames(hostName, p)))];
     await preloadIpFlags(profiles, allHostNames);
+    let proxyGeoInfo = new Map(); // proxyName -> {country, flag}
     let reqPath = encodeURI(`/${sysConfig.apiRoute}`);
 
     let proxiesArr = [];
@@ -4557,6 +4595,7 @@ async function buildClashJsonProfile(hostName, targetSub = null, allowInsecure =
                         if (isVless) {
                             let tagStr = getUniqueName(getConfigName("alpha", p.name, port, hName, ip, null, configIndex, ipName));
                             dynamicTags.push(tagStr);
+                            proxyGeoInfo.set(tagStr, getGeoInfo(ip));
                             let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
                             let payloadVl = { junk: randomJunk, protocol: "vl", mode: "proxyip", panelIPs: [] };
                             let pathStrVl = "/" + btoa(JSON.stringify(payloadVl));
@@ -4569,6 +4608,7 @@ async function buildClashJsonProfile(hostName, targetSub = null, allowInsecure =
                         if (isTrojan) {
                             let tagStr = getUniqueName(getConfigName("beta", p.name, port, hName, ip, null, configIndex, ipName));
                             dynamicTags.push(tagStr);
+                            proxyGeoInfo.set(tagStr, getGeoInfo(ip));
                             let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
                             let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: configIndex };
                             let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
@@ -4585,9 +4625,31 @@ async function buildClashJsonProfile(hostName, targetSub = null, allowInsecure =
         });
     });
 
-    if (dynamicTags.length === 0) {
-        dynamicTags.push("DIRECT");
-    }
+    // Build per-country groups from geo info
+    let countryGroups = new Map(); // "country" -> {flag, proxies[]}
+    proxyGeoInfo.forEach((geo, name) => {
+        let key = geo.country || "Unknown";
+        if (!countryGroups.has(key)) {
+            countryGroups.set(key, { flag: geo.flag || "🌐", proxies: [] });
+        }
+        countryGroups.get(key).proxies.push(name);
+    });
+    let sortedCountries = Array.from(countryGroups.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+
+    // Build proxy-groups JSON
+    let groupsJson = [
+        { name: "✅ Selector", type: "select", proxies: ["⚡ Fastest", "🖐 Manual", ...sortedCountries.map(([c, info]) => `${info.flag} ${c}`)] },
+        { name: "⚡ Fastest", type: "url-test", url: "https://www.gstatic.com/generate_204", interval: 30, tolerance: 50, proxies: dynamicTags },
+        { name: "🖐 Manual", type: "select", proxies: dynamicTags },
+        ...sortedCountries.map(([country, info]) => ({
+            name: `${info.flag} ${country}`,
+            type: "url-test",
+            url: "https://www.gstatic.com/generate_204",
+            interval: 30,
+            tolerance: 50,
+            proxies: info.proxies
+        }))
+    ];
 
     return {
         "mixed-port": 7890,
@@ -4661,21 +4723,7 @@ async function buildClashJsonProfile(hostName, targetSub = null, allowInsecure =
             }
         },
         [k_pxs]: proxiesArr,
-        [k_px_gps]: [
-            {
-                "name": "✅ Selector",
-                "type": "select",
-                "proxies": ["💦 Best Ping 🚀", ...fakeRefs, ...dynamicTags]
-            },
-            {
-                "name": "💦 Best Ping 🚀",
-                "type": "url-test",
-                "proxies": [...dynamicTags],
-                "url": "https://www.gstatic.com/generate_204",
-                "interval": 30,
-                "tolerance": 50
-            }
-        ],
+        [k_px_gps]: groupsJson,
         "rule-providers": {
             "category-ads-all": {
                 "type": "http",
@@ -4874,6 +4922,7 @@ async function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure
                         if (isVless) {
                             let tagStr = getUniqueName(getConfigName("alpha", p.name, port, hName, ip, null, configIndex, ipName));
                             dynamicTags.push(tagStr);
+                            proxyGeoInfo.set(tagStr, getGeoInfo(ip));
                             let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
                             let payloadVl = { junk: randomJunk, protocol: "vl", mode: "proxyip", panelIPs: [] };
                             let pathStrVl = "/" + btoa(JSON.stringify(payloadVl));
@@ -4885,6 +4934,7 @@ async function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure
                         if (isTrojan) {
                             let tagStr = getUniqueName(getConfigName("beta", p.name, port, hName, ip, null, configIndex, ipName));
                             dynamicTags.push(tagStr);
+                            proxyGeoInfo.set(tagStr, getGeoInfo(ip));
                             let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
                             let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: configIndex };
                             let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
